@@ -3,26 +3,22 @@ from enum import Enum
 import numpy as np
 from reward_distributor import RewardDistributionStrategy, create_strategy
 
-class EffortLevel(Enum):
-    NO_EFFORT   = 0
-    LOW_EFFORT  = 1
-    HIGH_EFFORT = 2
+class ParticipationDecision(Enum):
+    ABSTAIN    = 0
+    CONTRIBUTE = 1
 
 class ContributorType(Enum):
     EXTRINSIC = 0  # Primarily motivated by monetary rewards
-    BALANCED  = 1  # Balanced motivation between money and reputation
-    INTRINSIC = 2  # Primarily motivated by reputation/intrinsic factors
+    INTRINSIC = 1  # Primarily motivated by reputation/intrinsic factors
 
 class SkillLevel(Enum):
-    LOW    = 0
-    MEDIUM = 1
-    HIGH   = 2
+    LOW  = 0
+    HIGH = 1
 
 class ContributionQuality(Enum):
     NO_CONTRIBUTION = 0
     LOW_QUALITY     = 1
-    MED_QUALITY     = 2
-    HIGH_QUALITY    = 3
+    HIGH_QUALITY    = 2
 
 class PlatformAgent(Agent):
     """Platform agent that sets incentive policies."""
@@ -38,7 +34,6 @@ class PlatformAgent(Agent):
         self.reward_history    = {
             ContributionQuality.NO_CONTRIBUTION.value: [],
             ContributionQuality.LOW_QUALITY.value: [],
-            ContributionQuality.MED_QUALITY.value: [],
             ContributionQuality.HIGH_QUALITY.value: []
         }
         # Track per-step utility
@@ -65,7 +60,6 @@ class PlatformAgent(Agent):
         contribution_counts = {
             ContributionQuality.NO_CONTRIBUTION.value: 0,
             ContributionQuality.LOW_QUALITY.value:     0,
-            ContributionQuality.MED_QUALITY.value:     0,
             ContributionQuality.HIGH_QUALITY.value:    0
         }
         
@@ -83,30 +77,51 @@ class PlatformAgent(Agent):
                 self.total_benefit += contribution_value
                 self.current_step_benefit += contribution_value
         
-        # Distribute rewards from the pool based on contribution quality using the strategy
-        if contributors_with_contributions:
-            # Use the reward distribution strategy to calculate rewards per quality level
-            reward_per_quality = self.reward_strategy.distribute_rewards(
-                contribution_counts, 
-                self.reward_pool
-            )
+        # Prepare contributor data for reputation-aware strategies
+        contributors_data = []
+        for agent in contributors_with_contributions:
+            if isinstance(agent, ContributorAgent) and agent.contribution_history:
+                contributors_data.append(
+                    (agent.unique_id, agent.contribution_history[-1], agent.current_reputation)
+                )
+
+        # Use the reward distribution strategy to calculate rewards per quality level
+        reward_per_quality = self.reward_strategy.distribute_rewards(
+            contribution_counts, 
+            self.reward_pool,
+            contributors=contributors_data
+        )
+
+        # Check if strategy returned agent-specific rewards
+        agent_specific_rewards = getattr(self.reward_strategy, 'agent_rewards', None)
+
+        # Store in history for future reference
+        for quality, reward in reward_per_quality.items():
+            if quality in self.reward_history:
+                self.reward_history[quality].append(reward)
+
+        # Distribute rewards to contributors
+        for agent in contributors_with_contributions:
+            contribution = agent.contribution_history[-1]
             
-            # Store in history for future reference
-            for quality, reward in reward_per_quality.items():
-                if quality in self.reward_history:
-                    self.reward_history[quality].append(reward)
-            
-            # Distribute rewards to contributors
-            for agent in contributors_with_contributions:
-                contribution = agent.contribution_history[-1]
+            # Use agent-specific reward if available, otherwise use quality-based reward
+            if agent_specific_rewards and agent.unique_id in agent_specific_rewards:
+                reward = agent_specific_rewards[agent.unique_id]
+            else:
                 reward = reward_per_quality.get(contribution, 0)
-                agent.receive_reward(reward)
-                self.total_cost += reward
-                self.current_step_cost += reward
+            
+            agent.receive_reward(reward)
+            self.total_cost += reward
+            self.current_step_cost += reward
         
         # Calculate and store step utility
         step_utility = self.compute_step_utility()
         self.step_utility.append(step_utility)
+        
+        # After rewards are distributed, have each contributor finalize their step
+        for agent in self.model.agents:
+            if isinstance(agent, ContributorAgent):
+                agent.finalize_step()
         
         return {
             'utility': step_utility,
@@ -127,11 +142,9 @@ class PlatformAgent(Agent):
         if contribution_quality == ContributionQuality.NO_CONTRIBUTION.value:
             return 0
         elif contribution_quality == ContributionQuality.LOW_QUALITY.value:
-            return 0.5
-        elif contribution_quality == ContributionQuality.MED_QUALITY.value:
-            return 1.2
+            return 1
         else:  # HIGH_QUALITY
-            return 2.5
+            return 3
             
     def get_historical_rewards(self, contribution_quality):
         """Get historical rewards for a specific contribution quality."""
@@ -146,31 +159,31 @@ class PlatformAgent(Agent):
 
 class ContributorAgent(Agent):
     """
-    Contributor agent that makes strategic decisions on effort level and contribution quality.
+    Contributor agent that makes strategic decisions on participation and contribution quality.
     
     This class implements a boundedly rational agent in a game-theoretic framework who:
-    1. Has heterogeneous preferences based on contributor type (extrinsic, balanced, intrinsic)
-    2. Makes effort decisions to maximize expected utility
-    3. Has probabilistic contribution quality based on skill level and effort
+    1. Has heterogeneous preferences based on contributor type (extrinsic, intrinsic)
+    2. Makes participation decisions to maximize expected utility
+    3. Has probabilistic contribution quality based on skill level
     4. Forms beliefs about rewards through simplified fictitious play
     5. Adapts strategy based on observed reward history
     
     The agent's decision process models a form of Bayesian Nash Equilibrium where each agent:
-    - Chooses the effort level that maximizes expected utility given their beliefs
+    - Chooses whether to contribute based on maximizing expected utility given their beliefs
     - Has type-dependent sensitivities to monetary rewards vs. reputation gains
     - Forms beliefs about reward distribution through observing past outcomes
     - Has incomplete information about other agents' types and decisions
     
     The heterogeneity in the agent population creates strategic diversity:
-    - Extrinsic agents (30%): Primarily motivated by monetary rewards
-    - Balanced agents (50%): Equal sensitivity to monetary and reputation
-    - Intrinsic agents (20%): Primarily motivated by reputation/intrinsic factors
+    - Extrinsic agents (50%): Primarily motivated by monetary rewards
+    - Intrinsic agents (50%): Primarily motivated by reputation/intrinsic factors
     
     This heterogeneity combined with varying skill levels and adaptive learning
     leads to complex equilibrium dynamics in the model.
     """
     
-    def __init__(self, model, effort_cost, initial_reputation, contributor_type=None, skill_level=None):
+    def __init__(self, model, effort_cost, initial_reputation, contributor_type, skill_level,
+                 phi, delta, lambda_param, reward_learning_rate, use_ewa):
         """
         Initialize a contributor agent with heterogeneous attributes.
         
@@ -182,64 +195,90 @@ class ContributorAgent(Agent):
                              (None for random assignment based on distribution)
             skill_level: Skill level affecting contribution quality probabilities
                         (None for random assignment based on distribution)
+            phi: EWA parameter - decay factor for experience (0 to 1)
+                 Controls how quickly previous experience depreciates
+            delta: EWA parameter - weight on foregone payoffs (0 to 1)
+                   Higher values place more emphasis on what could have been earned
+            lambda_param: EWA parameter - softmax sharpness parameter
+                          Low values (0.5-1) create more exploration (choice probabilities closer)
+                          High values (>5) create exploitation (winner-take-all probabilities)
+            reward_learning_rate: Learning rate for updating reward estimates (0 to 1)
+                                 Controls how quickly agents adapt to new reward information
+                                 Higher values adapt faster but with more volatility
+            use_ewa: Whether to use Experience-Weighted Attraction learning (True) or
+                    direct utility maximization (False)
         """
         super().__init__(model)
         self.effort_cost          = effort_cost  # γ: cost of high-quality contributions
         self.current_reputation   = initial_reputation
         self.contribution_history = []
+        self.participation_decision_history = []  # Track actual participation decisions
         self.cumulative_rewards   = 0
+        self.use_ewa              = use_ewa  # Whether to use EWA learning or direct utility max
+        
+        # EWA learning parameters
+        self.phi = phi                    # Experience decay factor
+        self.delta = delta                # Weight on foregone payoffs
+        self.lambda_param = lambda_param  # Softmax sharpness parameter
+        self.reward_learning_rate = reward_learning_rate  # Learning rate for reward estimates
+        
+        # Initialize EWA attractions and experience
+        self.attractions = {
+            ParticipationDecision.ABSTAIN.value: 0.0,  
+            ParticipationDecision.CONTRIBUTE.value: 0.0
+        }
+        self.experience = 1.0  # Initial experience weight
+        
+        # Keep track of reward estimates for each quality level
+        self.reward_estimates = {
+            ContributionQuality.NO_CONTRIBUTION.value: 0,
+            ContributionQuality.LOW_QUALITY.value: 1.0,
+            ContributionQuality.HIGH_QUALITY.value: 2.0
+        }
+        
+        # Track the latest decision and reward for EWA updates
+        self.last_decision = None
+        self.last_reward = 0
+        self.last_utilities = {}  # Store utilities from last decision
         
         if contributor_type is None:
-            self.contributor_type = np.random.choice(list(ContributorType), p=[0.3, 0.5, 0.2])
+            self.contributor_type = np.random.choice(list(ContributorType), p=[0.5, 0.5])
         else:
             self.contributor_type = contributor_type
             
         if skill_level is None:
-            self.skill_level = np.random.choice(list(SkillLevel), p=[0.3, 0.5, 0.2])
+            self.skill_level = np.random.choice(list(SkillLevel), p=[0.5, 0.5])
         else:
             self.skill_level = skill_level
             
         if self.contributor_type == ContributorType.EXTRINSIC:
-            self.monetary_sensitivity   = np.random.uniform(0.8, 1.0)
-            self.reputation_sensitivity = np.random.uniform(0.1, 0.4)
-        elif self.contributor_type == ContributorType.BALANCED:
-            self.monetary_sensitivity   = np.random.uniform(0.4, 0.8)
-            self.reputation_sensitivity = np.random.uniform(0.4, 0.8)
+            self.monetary_sensitivity   = np.random.uniform(0.7, 1.0)
         else:  # INTRINSIC
-            self.monetary_sensitivity   = np.random.uniform(0.1, 0.4)
-            self.reputation_sensitivity = np.random.uniform(0.8, 1.0)
+            self.monetary_sensitivity   = np.random.uniform(0, 0.3)
+        
+        self.reputation_sensitivity = 1 - self.monetary_sensitivity
     
     def calculate_reputation_change(self, contribution_quality):
         """Calculate reputation change based on contribution quality."""
         if contribution_quality == ContributionQuality.HIGH_QUALITY.value:
-            return 0.08
-        elif contribution_quality == ContributionQuality.MED_QUALITY.value:
-            return 0.05
+            return 2
         elif contribution_quality == ContributionQuality.LOW_QUALITY.value:
-            return 0.02
+            return 1
         else:  # NO_CONTRIBUTION
             return 0
     
     def estimate_monetary_reward(self, contribution_quality):
         """
-        Estimate expected monetary reward based on contribution quality and historical reward distribution.
+        Estimate expected monetary reward based on contribution quality using exponential recency-weighting.
         
-        This method implements a simplified fictitious play approach where agents form beliefs
-        about expected rewards based on the observed history of rewards for each quality level.
-        Fictitious play is a learning process in game theory where players choose best responses
-        based on the empirical distribution of other players' past actions.
-        
-        In this context:
-        1. The agent observes historical rewards for each quality level
-        2. Forms beliefs about the expected reward for a given quality
-        3. Uses weighted averaging that gives more importance to recent observations
-           to account for potential changes in the reward distribution strategy
-        
-        For heterogeneous agents, this adaptive learning is crucial as:
-        - Different agent types (extrinsic, balanced, intrinsic) weigh monetary rewards differently
-        - Agents with different skill levels have different quality probability distributions
-        - The platform's reward strategy may distribute rewards differently as the mix of
-          contribution qualities changes over time
+        This method implements exponential recency-weighted averaging where more recent
+        rewards have exponentially higher influence than older rewards. This is controlled
+        by the reward_learning_rate parameter:
+        1. The agent retrieves the latest observed reward for the quality level
+        2. Updates its estimate using: new_estimate = (1 - L) * old_estimate + L * new_reward
+           where L is the reward_learning_rate
+        3. Higher learning rate means faster adaptation to recent rewards, but more volatility
+        4. Lower learning rate means more stable estimates but slower adaptation
         
         Args:
             contribution_quality: The quality level to estimate reward for
@@ -254,64 +293,46 @@ class ContributorAgent(Agent):
         platform = self.model.get_platform()
         historical_rewards = platform.get_historical_rewards(contribution_quality)
 
-        # Fictitious play implementation
+        # If there's reward history for this quality level
         if historical_rewards:
-            # Calculate weighted average with more weight on recent observations
-            # This balances between:
-            # - Learning from historical patterns (stability)
-            # - Adapting to recent changes (responsiveness)
+            # Get the most recent observed reward
+            latest_reward = historical_rewards[-1]
             
-            if len(historical_rewards) >= 5:
-                # With longer history, use weighted recency-biased average
-                weights = np.linspace(0.5, 1.0, min(5, len(historical_rewards)))
-                weights = weights / np.sum(weights)  # Normalize weights
-                
-                # Calculate weighted average of recent rewards
-                recent_rewards = historical_rewards[-5:]
-                expected_reward = np.sum(np.array(recent_rewards) * weights)
-                
-                # Add small exploration bonus if reward varies significantly
-                # (encourages exploring when reward distribution is unstable)
-                reward_std = np.std(recent_rewards)
-                if reward_std > 0.5:
-                    exploration_bonus = 0.1 * reward_std
-                    # Adjust based on agent type - extrinsic agents explore more for monetary gain
-                    if self.contributor_type == ContributorType.EXTRINSIC:
-                        expected_reward += exploration_bonus
-            else:
-                # With limited history, use simple average
-                expected_reward = sum(historical_rewards) / len(historical_rewards)
+            # Update estimate using exponential recency-weighting formula
+            current_estimate = self.reward_estimates.get(contribution_quality, contribution_quality)
+            updated_estimate = (1 - self.reward_learning_rate) * current_estimate + self.reward_learning_rate * latest_reward
+            
+            # Store the updated estimate
+            self.reward_estimates[contribution_quality] = updated_estimate
+                    
+            return updated_estimate
         else:
-            # Fall back to initial estimate if no history
-            # Higher quality should reasonably expect higher reward
-            expected_reward = contribution_quality
-            
-        return expected_reward
+            # If no history, use the initial estimate (same as quality level)
+            self.reward_estimates[contribution_quality] = contribution_quality
+            return contribution_quality
     
-    def calculate_effort_cost(self, effort_level):
-        """Calculate effort cost based on effort level."""
-        if effort_level == EffortLevel.NO_EFFORT.value:
+    def calculate_effort_cost(self, participation_decision):
+        """Calculate effort cost based on participation decision."""
+        if participation_decision == ParticipationDecision.ABSTAIN.value:
             return 0
-        elif effort_level == EffortLevel.HIGH_EFFORT.value:
+        else:  # CONTRIBUTE
             return self.effort_cost
-        else:  # LOW_EFFORT
-            return self.effort_cost * 0.3
         
-    def compute_expected_utility(self, effort_level):
+    def compute_expected_utility(self, participation_decision):
         """
-        Compute expected utility for a given effort level with non-linear effects.
+        Compute expected utility for a given participation decision.
         
         This is the core game-theoretic decision function that implements utility maximization
         for heterogeneous agents. Each agent computes the expected utility for each possible
-        effort level and chooses the one that maximizes their utility.
+        participation decision and chooses the one that maximizes their utility.
         
         The utility function incorporates:
         1. Expected monetary rewards: Weighted by monetary sensitivity (varies by agent type)
         2. Expected reputation gains: Weighted by reputation sensitivity (varies by agent type)
-        3. Effort costs: Based on effort level and individual cost parameter
+        3. Effort costs: Based on participation decision and individual cost parameter
         
-        For each possible effort level, the agent:
-        - Estimates contribution quality probabilities (based on skill and effort)
+        For each possible participation decision, the agent:
+        - Estimates contribution quality probabilities (based on skill)
         - Calculates expected monetary reward for each possible quality
         - Calculates expected reputation change for each possible quality
         - Computes the weighted expectation across all possible quality outcomes
@@ -322,21 +343,21 @@ class ContributorAgent(Agent):
         where different agents may find different strategies optimal.
         
         Args:
-            effort_level: The effort level to calculate utility for
+            participation_decision: The participation decision to calculate utility for
             
         Returns:
-            Expected utility value for the given effort level
+            Expected utility value for the given participation decision
         """
         platform = self.model.get_platform()
         
-        if effort_level == EffortLevel.NO_EFFORT.value:
+        if participation_decision == ParticipationDecision.ABSTAIN.value:
             # Consider the opportunity cost of not contributing (potential loss of reputation)
             reputation_change = self.calculate_reputation_change(ContributionQuality.NO_CONTRIBUTION.value)
             reputation_utility = reputation_change * self.reputation_sensitivity
             return reputation_utility
         
-        # Estimate the expected quality based on effort and skill
-        expected_quality_probs = self.quality_probabilities(effort_level)
+        # Estimate the expected quality based on skill
+        expected_quality_probs = self.quality_probabilities(participation_decision)
         
         # Calculate expected monetary utility using historical rewards
         expected_monetary_utility = 0
@@ -349,106 +370,101 @@ class ContributorAgent(Agent):
             reputation_change = self.calculate_reputation_change(quality)
             expected_reputation_utility += prob * reputation_change * self.reputation_sensitivity
         
-        # Cost based on effort level
-        cost = self.calculate_effort_cost(effort_level)
+        # Cost based on participation
+        cost = self.calculate_effort_cost(participation_decision)
             
         return (expected_monetary_utility + 
                 expected_reputation_utility -
                 cost)
     
-    def quality_probabilities(self, effort_level):
+    def quality_probabilities(self, participation_decision):
         """
-        Estimate probabilities of different quality outcomes based on effort and skill.
+        Estimate probabilities of different quality outcomes based on participation and skill.
         
-        This method implements the stochastic mapping from effort decisions to contribution
+        This method implements the stochastic mapping from participation decisions to contribution
         quality outcomes, which is a critical component of the game's information structure.
         The probabilistic nature creates:
         
         1. Strategic uncertainty: Agents cannot perfectly predict their contribution quality
         2. Skill differentiation: Higher skill agents have better quality distributions
-        3. Effort-quality relationship: Higher effort increases probability of better quality
         
         This probability distribution forms the basis for expected utility calculations in
         the game-theoretic decision model. It creates a strategic trade-off where:
-        - High-skill agents have stronger incentives for high effort (better returns)
-        - Low-skill agents may find high effort less worthwhile (lower quality improvement)
-        - Different agent types will have different optimal effort strategies based on
+        - High-skill agents have stronger incentives to contribute (better returns)
+        - Low-skill agents may find contributing less worthwhile (lower quality outcomes)
+        - Different agent types will have different optimal strategies based on
           their skill level and sensitivity parameters
         
         Args:
-            effort_level: The effort level for which to calculate quality probabilities
+            participation_decision: The participation decision for which to calculate quality probabilities
             
         Returns:
             Dictionary mapping contribution quality levels to probabilities
         """
-        if effort_level == EffortLevel.NO_EFFORT.value:
+        if participation_decision == ParticipationDecision.ABSTAIN.value:
             return {
                 ContributionQuality.HIGH_QUALITY.value: 0.0,
-                ContributionQuality.MED_QUALITY.value: 0.0,
                 ContributionQuality.LOW_QUALITY.value: 0.0,
                 ContributionQuality.NO_CONTRIBUTION.value: 1.0
             }
         
         if self.skill_level == SkillLevel.LOW:
-            if effort_level == EffortLevel.HIGH_EFFORT.value:
-                return {
-                    ContributionQuality.HIGH_QUALITY.value:    0.05,
-                    ContributionQuality.MED_QUALITY.value:     0.15,
-                    ContributionQuality.LOW_QUALITY.value:     0.6,
-                    ContributionQuality.NO_CONTRIBUTION.value: 0.2
-                }
-            else:  # LOW_EFFORT
-                return {
-                    ContributionQuality.HIGH_QUALITY.value:    0.0,
-                    ContributionQuality.MED_QUALITY.value:     0.05,
-                    ContributionQuality.LOW_QUALITY.value:     0.7,
-                    ContributionQuality.NO_CONTRIBUTION.value: 0.25
-                }
-            
-        elif self.skill_level == SkillLevel.MEDIUM:
-            if effort_level == EffortLevel.HIGH_EFFORT.value:
-                return {
-                    ContributionQuality.HIGH_QUALITY.value:    0.5,
-                    ContributionQuality.MED_QUALITY.value:     0.35,
-                    ContributionQuality.LOW_QUALITY.value:     0.1,
-                    ContributionQuality.NO_CONTRIBUTION.value: 0.05
-                }
-            else:  # LOW_EFFORT
-                return {
-                    ContributionQuality.HIGH_QUALITY.value:    0.1,
-                    ContributionQuality.MED_QUALITY.value:     0.3,
-                    ContributionQuality.LOW_QUALITY.value:     0.5,
-                    ContributionQuality.NO_CONTRIBUTION.value: 0.1
-                }
-            
+            return {
+                ContributionQuality.HIGH_QUALITY.value:    0.2,
+                ContributionQuality.LOW_QUALITY.value:     0.6,
+                ContributionQuality.NO_CONTRIBUTION.value: 0.2
+            }
         else:  # HIGH skill
-            if effort_level == EffortLevel.HIGH_EFFORT.value:
-                return {
-                    ContributionQuality.HIGH_QUALITY.value:    0.8,
-                    ContributionQuality.MED_QUALITY.value:     0.15,
-                    ContributionQuality.LOW_QUALITY.value:     0.04,
-                    ContributionQuality.NO_CONTRIBUTION.value: 0.01
-                }
-            else:  # LOW_EFFORT
-                return {
-                    ContributionQuality.HIGH_QUALITY.value:    0.3,
-                    ContributionQuality.MED_QUALITY.value:     0.4,
-                    ContributionQuality.LOW_QUALITY.value:     0.25,
-                    ContributionQuality.NO_CONTRIBUTION.value: 0.05
-                }
+            return {
+                ContributionQuality.HIGH_QUALITY.value:    0.7,
+                ContributionQuality.LOW_QUALITY.value:     0.28,
+                ContributionQuality.NO_CONTRIBUTION.value: 0.02
+            }
     
-    def decide_effort_level(self):
-        """Decide effort level based on expected utility."""
-        utilities = {level.value: self.compute_expected_utility(level.value) for level in list(EffortLevel)}
+    def decide_participation(self):
+        """
+        Decide whether to participate based on expected utility maximization or EWA learning.
         
-        # Choose the effort level with highest utility
-        chosen_level = max(utilities.items(), key=lambda x: x[1])[0]
-        return chosen_level
+        If use_ewa is True, uses Experience-Weighted Attraction (EWA) learning with softmax decision rule.
+        If use_ewa is False, directly maximizes expected utility.
+        
+        Returns:
+            The chosen participation decision (0 for abstain, 1 for contribute)
+        """
+        # Compute utilities for each possible decision
+        # We'll save these for the EWA update in finalize_step
+        self.last_utilities = {
+            decision.value: self.compute_expected_utility(decision.value) 
+            for decision in list(ParticipationDecision)
+        }
+        
+        if self.use_ewa:
+            # EWA LEARNING APPROACH
+            # Get the current attraction values
+            attraction_values = list(self.attractions.values())
+            
+            # Apply softmax with lambda parameter to get probabilities
+            # Higher lambda = more exploitation, lower = more exploration
+            exp_attractions = np.exp(np.array(attraction_values) * self.lambda_param)
+            probabilities = exp_attractions / np.sum(exp_attractions)
+            
+            # Choose decision based on probabilities
+            decisions = list(self.attractions.keys())
+            chosen_decision = np.random.choice(decisions, p=probabilities)
+        else:
+            # DIRECT UTILITY MAXIMIZATION APPROACH
+            # Simply choose the decision with the highest expected utility
+            chosen_decision = max(self.last_utilities, key=self.last_utilities.get)
+        
+        # Save the chosen decision for EWA update
+        self.last_decision = chosen_decision
+        
+        return chosen_decision
     
-    def determine_quality(self, effort_level):
-        """Determine the actual quality based on effort level and skill level with randomization."""
+    def determine_quality(self, participation_decision):
+        """Determine the actual quality based on participation decision and skill level with randomization."""
         # Get probabilities from quality_probabilities method
-        probs = self.quality_probabilities(effort_level)
+        probs = self.quality_probabilities(participation_decision)
         
         # Use numpy.random.choice with the probabilities
         return np.random.choice(
@@ -458,9 +474,9 @@ class ContributorAgent(Agent):
         
     def step(self):
         """Contributor's step function."""
-
-        effort_level = self.decide_effort_level()
-        actual_quality = self.determine_quality(effort_level)
+        participation_decision = self.decide_participation()
+        self.participation_decision_history.append(participation_decision)  # Store participation decision
+        actual_quality = self.determine_quality(participation_decision)
         self.contribution_history.append(actual_quality)
         
         return actual_quality
@@ -468,7 +484,66 @@ class ContributorAgent(Agent):
     def receive_reward(self, reward):
         """Receive monetary reward."""
         self.cumulative_rewards += reward
+        self.last_reward = reward  # Store for EWA update
+    
+    def finalize_step(self):
+        """
+        Update attractions after rewards have been distributed.
+        This implements the Experience-Weighted Attraction (EWA) learning update.
         
+        EWA combines reinforcement learning and belief-based learning in a single framework:
+        1. phi: Controls how much previous experience is discounted
+        2. delta: Weight placed on foregone payoffs (counterfactual reasoning)
+        3. lambda: Controls the sensitivity to attractions (exploration vs. exploitation)
+        """
+        if self.last_decision is None:
+            # Skip if there's no decision to update
+            return
+            
+        # Only update EWA attractions if we're using EWA learning
+        if self.use_ewa:
+            # Update experience
+            self.experience = self.phi * (1 - self.delta) * self.experience + 1
+            
+            # For each possible action, update the attraction
+            for action, utility in self.last_utilities.items():
+                # Calculate the actual utility for the chosen action
+                # For the chosen action, we use the actual reward received
+                if action == self.last_decision:
+                    # For the chosen action, use actual reward
+                    if action == ParticipationDecision.CONTRIBUTE.value:
+                        # Adjust utility with actual reward instead of expected reward
+                        # First compute base utility without monetary reward
+                        reputation_utility = 0
+                        for quality, prob in self.quality_probabilities(action).items():
+                            reputation_change = self.calculate_reputation_change(quality)
+                            reputation_utility += prob * reputation_change * self.reputation_sensitivity
+                        
+                        # Use actual reward instead of expected
+                        actual_utility = (self.last_reward * self.monetary_sensitivity + 
+                                        reputation_utility - 
+                                        self.calculate_effort_cost(action))
+                    else:
+                        # For ABSTAIN, use the calculated utility
+                        actual_utility = utility
+                    
+                    # Update attraction for chosen action
+                    self.attractions[action] = (
+                        (self.phi * self.experience * self.attractions[action] + actual_utility) / 
+                        self.experience
+                    )
+                else:
+                    # For unchosen actions, update based on foregone payoffs
+                    # Delta controls weight on unchosen actions (counterfactual reasoning)
+                    self.attractions[action] = (
+                        (self.phi * self.experience * self.attractions[action] + self.delta * utility) / 
+                        self.experience
+                    )
+        
+        # Reset for next step
+        self.last_decision = None
+        self.last_reward = 0
+    
     def update_reputation(self, reputation_change):
         """Update agent's reputation."""
         self.current_reputation += reputation_change 
